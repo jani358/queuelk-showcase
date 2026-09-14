@@ -1,0 +1,92 @@
+# Reference only. All credentials come from a local .env file (never committed);
+# `docker compose` reads it automatically. See .env.example in the private repo.
+services:
+  postgres:
+    # Plain postgres:16 — unlike the AskLK project, QueueLK needs no extensions.
+    # Everything it relies on (row locks, unique constraints, date columns) is
+    # core PostgreSQL.
+    image: postgres:16-alpine
+    container_name: queuelk-postgres
+    environment:
+      POSTGRES_USER: queuelk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: queuelk
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queuelk"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: queuelk-redis
+    ports:
+      - "6379:6379"
+    # NO appendonly, deliberately — the opposite of the usual default.
+    #
+    # Redis holds only pub/sub fan-out, rate-limit windows and a slug cache. None
+    # of it is a system of record: token numbers are allocated in Postgres with a
+    # row lock precisely so that Redis losing everything is survivable. Persisting
+    # data we are happy to lose would buy disk I/O for no benefit, and a restart
+    # restoring stale rate-limit windows is marginally worse than starting clean.
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- application services ---
+  # Enable with:  docker compose --profile full up -d
+  # Day-to-day development runs the apps on the host against the two services
+  # above, which gives hot reload.
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: queuelk-api
+    profiles: ["full"]
+    environment:
+      DATABASE_URL: postgresql://queuelk:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/queuelk
+      REDIS_URL: redis://redis:6379
+      # No defaults for these. The Joi schema rejects a placeholder, so a missing
+      # value is a clear boot failure rather than a forgeable token.
+      #
+      # Quoted because the ${VAR:?message} error text contains ": " and "://",
+      # which YAML would otherwise read as a nested mapping.
+      JWT_SECRET: "${JWT_SECRET:?set in .env - generate one with openssl rand -hex 32}"
+      JWT_REFRESH_SECRET: "${JWT_REFRESH_SECRET:?set in .env - must differ from JWT_SECRET}"
+      DEVICE_COOKIE_SECRET: "${DEVICE_COOKIE_SECRET:?set in .env - generate one with openssl rand -hex 32}"
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3001}
+      PORT: 3000
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* is inlined at BUILD time, not read at runtime, so it must
+        # be a build arg. Changing it later needs a rebuild, not a restart.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3000/api}
+    container_name: queuelk-web
+    profiles: ["full"]
+    ports:
+      - "3001:3001"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
