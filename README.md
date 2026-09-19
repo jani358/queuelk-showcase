@@ -121,6 +121,7 @@ Full write-ups: [docs/01-ARCHITECTURE.md](docs/01-ARCHITECTURE.md) · [docs/02-D
 | **Nearly your turn** — sound + vibration alert<br>![Nearly](screenshots/03-patient-nearly.png) | **The staff console** — `/console`, thumb-zone primary action<br>![Console](screenshots/04-console.png) |
 | **Owner dashboard** — served count, median wait, no-show rate<br>![Dashboard](screenshots/05-dashboard.png) | **Reports** — medians and CSV export<br>![Reports](screenshots/06-reports.png) |
 | **The printable QR poster** — hand-rolled SVG encoder<br>![Poster](screenshots/07-qr-poster.png) | **Take a number** — what the patient sees after scanning<br>![Take token](screenshots/08-take-token.png) |
+| **Sinhala, Tamil, English** — the patient picks; the clinic sets a default<br>![Trilingual](screenshots/09-trilingual.png) | **Every endpoint documented** — OpenAPI at `/docs`<br>![API docs](screenshots/10-swagger.png) |
 
 ## The interesting problems
 
