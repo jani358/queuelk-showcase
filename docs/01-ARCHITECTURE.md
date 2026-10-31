@@ -61,7 +61,8 @@ waiting room genuinely contains all three.
 
 ## 2. System overview
 
-Nine boxes. This is the whole thing, and it should take about two minutes on a whiteboard.
+Nine boxes — ten since Phase 1 added the browser push services. This is the whole thing, and it
+should take about two minutes on a whiteboard.
 
 ```
   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
@@ -73,21 +74,29 @@ Nine boxes. This is the whole thing, and it should take about two minutes on a w
          └────────┬────────┴────────┬────────┴─────────────────┘
                   │                 │
         JSON+JWT  │                 │  SSE (EventSource, text/event-stream)
+   + Socket.io    │                 │  for the TV and the patient phone
+   /staff (ADR 1) │                 │
                   │                 │
          ┌────────▼─────────────────▼──────────┐
          │      apps/web — Next.js 14          │
          │  App Router · Tailwind · TanStack   │
          │  Query · Zustand · si/ta/en         │
          └────────────────┬────────────────────┘
-                          │  JSON + SSE
+                          │  JSON + SSE + Socket.io
          ┌────────────────▼────────────────────────────┐
          │          apps/api — NestJS 10               │
          │                                             │
          │  auth · tenants · queues · tokens           │
          │  realtime · reports · public · health       │
+         │  staff gateway (Socket.io) · notifications  │
          │                                             │
          │  idempotency · device cookie · rate limit   │
-         └──────┬───────────────────────┬──────────────┘
+         └──────┬───────────────────────┬──────────┬───┘
+                │                       │          │ Web Push (VAPID)
+                │                       │          ▼
+                │                       │   browser push service
+                │                       │   (FCM / Mozilla / Apple)
+                │                       │   → public/sw.js on the phone
                 │ Prisma / $queryRaw    │ ioredis
                 │                       │
       ┌─────────▼──────────┐   ┌────────▼─────────────┐
@@ -100,6 +109,9 @@ Nine boxes. This is the whole thing, and it should take about two minutes on a w
       │ tokens             │   │                      │
       │ idempotency_keys   │   │ rate-limit windows   │
       │ audit_events       │   │ slug→id cache        │
+      │ push_subscriptions │   │ qlk:sio#* (Socket.io │
+      │ notification_      │   │   Redis adapter)     │
+      │   deliveries       │   │                      │
       └────────────────────┘   └──────────────────────┘
          system of record          disposable
 ```
@@ -168,8 +180,8 @@ offers a switcher, because there the reader is one identifiable person.
 ### PostgreSQL 16
 
 The system of record, and specifically the place where the **numbering invariant** lives.
-`SELECT ... FOR UPDATE` on a `queue_counters` row is a boring, forty-year-old feature that
-does exactly the right thing, and the entire "why not Redis INCR" argument in §7 is really
+A row lock on a `queue_counters` row, taken by one `INSERT … ON CONFLICT DO UPDATE …
+RETURNING`, is a boring, decades-old feature that does exactly the right thing, and the entire "why not Redis INCR" argument in §7 is really
 an argument that this boring feature is the correct tool.
 
 It also holds the idempotency records, which is not a detail: they must be **exactly as
@@ -180,11 +192,12 @@ transaction, which decides the question.
 ### Redis 7
 
 Three jobs, with three different failure tolerances, all documented at the top of
-`redis.service.ts`:
+`redis.service.ts` — plus, since Phase 1, the Socket.io adapter for the staff console:
 
 | Use | Why Redis | What happens when it's down |
 |---|---|---|
 | **Pub/sub fan-out for SSE** | The reason Redis is here at all. A display connected to pod B must learn about a "call next" handled by pod A | Displays go stale; they show a "reconnecting" badge and fall back to polling `/public/queues`. Clinic keeps working |
+| **Socket.io Redis adapter** (Phase 1) | The same problem for the staff console: a `queue_state` emitted on pod A must reach a tablet on pod B. Separate connections and a `qlk:sio` key prefix | Cross-pod console updates stop; each console still gets its own command acks, and its poll (30 s while "live", 5 s otherwise) is the floor |
 | Rate limiting (sliding window, one Lua script) | Atomic read-modify-write on a sorted set, with free expiry. A fixed window lets a caller send `limit` at 00:59 and `limit` again at 01:00 | **Fails open** — the request is allowed. Safe only because the limits that protect correctness (`dailyCapacity`, one-token-per-device) are Postgres-side |
 | Slug → tenant id cache | Every public request resolves a slug; this is a hot, tiny, read-only lookup | One extra indexed read per request |
 
@@ -223,6 +236,67 @@ transaction, and the per-IP window.
 top-level navigation from outside the site, and `'strict'` would withhold the cookie on
 exactly that first request and mint a new device on every single scan.
 
+### The staff socket (Phase 1)
+
+The console used to poll. It now holds a Socket.io connection to the `/staff` namespace
+(`apps/api/src/staff-realtime/`). The decision and its costs are in
+[ADR 0001](adr/0001-sse-for-public-socketio-for-staff.md); the shape, briefly:
+
+- **Handshake auth** with the access JWT in the `auth` payload, checked by a namespace
+  middleware that calls `JwtStrategy.validate` — the same check as every HTTP request — and
+  then a role gate (OWNER / STAFF). The socket is closed when the token expires; every
+  command re-validates the user, so a deactivated tablet loses access on its next press.
+- **Rooms** `tenant:{tenantId}:queue:{queueId}`, joined only after the queue is loaded with
+  the socket's own tenant id in the `WHERE`. Another clinic's queue is a `NotFound` ack, and
+  its room name is never computed.
+- **Commands** `call_next`, `recall`, `skip`, `no_show`, `done`, each acknowledged with
+  the resulting token or a typed error (`Unauthorized | Forbidden | NotFound | Conflict |
+  BadRequest | Internal`, with the status REST would have returned). The gateway calls the
+  same `TokensService` methods as the REST controller — no business logic of its own.
+- **`queue_state`** — the full staff snapshot, emitted to the room from
+  `QueuesService.broadcast` after every committed change, whatever made it. In-process
+  rather than via a Redis subscription on every pod: the instance that made the change emits
+  once and the Redis adapter delivers it everywhere, instead of every pod emitting it again.
+- **Fallback** — the console keeps REST. When the socket is down it says so ("Reconnecting…"
+  / "Offline") and sends commands over REST; when a socket command times out it re-sends
+  over REST **with the same idempotency key**, so the server replays rather than repeats.
+
+### Notifications: Web Push, the service worker and the channel chain (Phase 1)
+
+The patient page always alerted with sound and vibration — but only while it was open. A
+patient who locked their phone and walked to the shop was not told anything. Phase 1 adds
+the closed-tab path without touching the open-tab one:
+
+- **Opt-in** on `/t/[publicId]`: a button that says what it does, a sentence saying the
+  browser will ask, and only then `Notification.requestPermission()`. Nothing is requested on
+  page load. Blocked permissions and iPhones outside a home-screen app get a one-line
+  explanation instead of a button that cannot work.
+- **Subscriptions** (`push_subscriptions`) are bound to the token — the publicId is the only
+  credential the patient has — carry the tenant id like every table, and cascade-delete with
+  the token. They are also deleted when the token finishes, and on a 404/410 from the push
+  service. The endpoint must belong to a known browser push service (FCM, Mozilla, Apple,
+  WNS): an anonymous "store this URL and POST to it later" endpoint is otherwise a free SSRF
+  primitive.
+- **When** — `NotificationsService.queueChanged`, called from `TokensService.afterChange`,
+  the same hook that publishes the SSE events the open page alerts on: "approaching" once
+  when the token is within two of the front, "called" on every call and recall. Fire-and-
+  forget, so a slow push service never delays "Call next".
+- **Exactly once** — a `notification_deliveries` row with `UNIQUE (tokenId, dedupeKey)` is
+  inserted before the first send. Two API instances reacting to the same change race on the
+  insert; the loser stays quiet.
+- **The channel chain** (`notifications/channel-chain.ts`): every channel implements
+  `NotificationChannel { canDeliver, send }`; the dispatcher walks the tenant plan's chain —
+  FREE: push → none; STARTER/PRO: push → sms → none, overridable per tenant in
+  `tenant.features` — and stops at the first channel that delivers. The SMS channel and its
+  Dialog eSMS / Notify.lk adapters are **stubs**: they report themselves unconfigured and
+  make no network calls, because v1 stores only a hash of the phone number (see §9).
+- **The service worker** (`apps/web/public/sw.js`, hand-written, production builds only)
+  shows the notification the server rendered in the patient's chosen language, focuses or
+  opens the token page on click, and serves `offline-token.html` — the last known number
+  and position, clearly marked as old — when a `/t/*` navigation fails. It caches nothing
+  else. A web app manifest makes the page installable, which is the only way an iPhone
+  receives Web Push at all.
+
 ---
 
 ## 4. The full life of one token
@@ -253,16 +327,15 @@ This is the walkthrough to be able to give from memory. Follow the numbers; ever
    │      hit? replay stored body, STOP.         │             │           │
    │            │             │                 │             │           │
  6 │      ┌──── BEGIN ───────────────────────────►│           │           │
-   │      │ SELECT id FROM queues … FOR UPDATE   │            │           │
+   │      │ SELECT … FROM queues (no lock)       │            │           │
    │      │ queue.status must be OPEN            │            │           │
    │      │ serviceDate(tenant.timezone) → date  │            │           │
+ 7 │      │ ★ INSERT INTO queue_counters … VALUES (…, 1)      │           │
+   │      │     ON CONFLICT (queue_id, service_date)          │           │
+   │      │     DO UPDATE SET last_number = last_number + 1   │           │
+   │      │     RETURNING last_number  ← THE LOCK │           │           │
    │      │ device already holds an ACTIVE token?│            │           │
    │      │ dailyCapacity COUNT check            │            │           │
- 7 │      │ ★ SELECT last_number FROM queue_counters          │           │
-   │      │     WHERE queue_id=$1 AND service_date=$2         │           │
-   │      │     FOR UPDATE          ← THE LOCK   │            │           │
-   │      │   next = last_number + 1             │            │           │
-   │      │   UPDATE queue_counters SET last_number = next    │           │
  8 │      │ INSERT INTO tokens (…, number, publicId)          │           │
    │      │   UNIQUE(queue_id, service_date, number) backstop │           │
    │      │ INSERT INTO audit_events ('token.issued')         │           │
@@ -283,7 +356,8 @@ This is the walkthrough to be able to give from memory. Follow the numbers; ever
 11 │      staff tap "Call next" on the console   │             │           │
    │      POST /queues/:id/call-next  +Idempotency-Key         │           │
    │      ┌──── BEGIN ───────────────────────────►│           │           │
-   │      │ SELECT id FROM queues … FOR UPDATE   │            │           │
+   │      │ SELECT id FROM queues …              │            │           │
+   │      │   FOR NO KEY UPDATE  ← counter lock  │            │           │
    │      │ SELECT … WHERE status='WAITING'      │            │           │
    │      │   ORDER BY number ASC LIMIT 1        │            │           │
 12 │      │ ★ UPDATE tokens SET status='CALLED', called_at=now│           │
@@ -335,19 +409,19 @@ and returning the first response would report success for an action that never h
 *What could go wrong:* two requests with the same key arrive close enough that both pass
 this check. Handled — see §6.
 
-**6 — The queue lock and the pre-conditions.** `SELECT id FROM queues … FOR UPDATE`. Then
-`queue.status === OPEN`, then `serviceDate(tenant.timezone)`, then the one-active-token-per-
-device check, then the `dailyCapacity` count. All four are **inside the transaction**, which
-is the entire point: the device check lives here and not only in the Redis limiter because
-the limiter fails open, and "Redis is down" must never become "anyone can mint unlimited
-tokens".
+**6 — The pre-conditions and the number.** A plain tenant-scoped read of the queue
+(`status === OPEN`), `serviceDate(tenant.timezone)`, then the number is claimed with one
+`INSERT … ON CONFLICT DO UPDATE` on `queue_counters`, which takes that row's lock until
+commit. Only then the one-active-token-per-device check and the `dailyCapacity` count, so
+they run one issuer at a time. All of it is **inside the transaction**: the device check
+lives here and not only in the Redis limiter because the limiter fails open, and "Redis is
+down" must never become "anyone can mint unlimited tokens".
 
-**7 — The number is allocated.** The row lock. This is §5 and `02-DATABASE.md` §4.
-*What could go wrong:* it is the first token of the day and the counter row does not exist —
-`FOR UPDATE` cannot lock a row that is not there, so two concurrent first-issuers both find
-nothing and both try to `INSERT`. The unique index lets one win; the loser catches `P2002`
-and retries the locked read, which now finds the winner's row and blocks on it properly.
-That retry is guaranteed to succeed, so there is no retry loop.
+**7 — Why only the counter row.** Issuing does not lock the `queues` row that "call next"
+uses, so patients and counters do not wait for each other (ADR 0007, the k6 morning rush).
+The first token of the day needs no special case: the upsert inserts 1, and a concurrent
+first issuer waits on the unique index and then takes the UPDATE path. See
+`02-DATABASE.md` §4.
 
 **8 — The INSERT, and everything else, in one transaction.** Token row, audit row,
 idempotency row. If any of them fails, the number is not consumed. A design that allocated
@@ -422,7 +496,7 @@ Three layers, each covering the one above:
 
 | Layer | Mechanism | Covers |
 |---|---|---|
-| 1 | `SELECT last_number … FOR UPDATE` on the `queue_counters` row | Concurrency. Postgres serialises issuers on one row, in arrival order |
+| 1 | The row lock taken by `INSERT … ON CONFLICT DO UPDATE … RETURNING` on the `queue_counters` row | Concurrency. Postgres serialises issuers on one row, in arrival order |
 | 2 | `UNIQUE (queue_id, service_date, number)` on `tokens` | A bug, a migration, or a manual `INSERT` during support that bypasses layer 1 |
 | 3 | The same transaction enforces `dailyCapacity` | A rejected token cannot have consumed a number |
 
@@ -477,6 +551,12 @@ attempts gets a spurious 409 on a retry that is genuinely the same request.
 ## 7. Trade-offs consciously rejected
 
 ### WebSockets instead of SSE
+
+> **Updated in Phase 1:** still rejected for the TV display and the patient phone. The staff
+> console now uses Socket.io, because it is the one surface that sends as much as it receives
+> and needs a per-command answer — see
+> [ADR 0001](adr/0001-sse-for-public-socketio-for-staff.md). The argument below is the reason
+> the public surfaces stayed on SSE.
 
 The fashionable answer, and the wrong one here. The full argument lives at the top of
 `sse-writer.ts`:
@@ -613,8 +693,8 @@ Rejected on two structural grounds, not on cost.
 Serverless platforms cap execution duration and bill by it; a twelve-hour streaming response
 is the shape those platforms exist to avoid.
 
-**Connection pooling.** The numbering design depends on `SELECT … FOR UPDATE` inside a
-transaction, and a fleet of short-lived function instances each opening its own Postgres
+**Connection pooling.** The numbering design depends on a row lock (the `queue_counters`
+upsert) held inside a transaction, and a fleet of short-lived function instances each opening its own Postgres
 connection is the classic way to exhaust a small database. The fix is a pooler, and
 transaction-mode pooling plus session-scoped locks is a combination that needs care. A
 long-lived Node process with one Prisma pool avoids the entire category.
@@ -674,7 +754,9 @@ failover. For a three-clinic deployment with nightly backups that is an honest t
 fifty clinics it is not, and a streaming replica plus a documented promotion procedure is
 the first operational thing I would add.
 
-**No SMS.** `phoneHash` and `phoneLast4` exist and the plaintext number is never stored,
+**No SMS (yet).** Phase 1 added the channel abstraction and an SMS channel with Dialog eSMS and
+Notify.lk adapter stubs, wired into the per-plan chain and tested with a fake — but nothing can
+be sent, for the reason that follows. `phoneHash` and `phoneLast4` exist and the plaintext number is never stored,
 which means the "you are next" SMS everyone asks for is *not shippable without a schema
 change* — deliberately. v1 sends no SMS, so the plaintext has no use, and a database of
 patient phone numbers at a medical clinic is the single worst thing in this system to leak.
@@ -701,15 +783,22 @@ an interval a patient has to interpret. That is a judgement, not a measurement.
 **The device cookie is not an identity.** Private window, cleared cookies, second phone — all
 free. §3 says this plainly and the hard limits are elsewhere.
 
-**No load testing.** Every concurrency claim in this document is argued from first principles
-and covered by an integration test that fires ten simultaneous issue requests. That is
-enough to catch a missing `FOR UPDATE`; it is not enough to characterise behaviour at the
-lock under a thousand concurrent issuers. **Like the evaluation-set gap in AskLK, this is
-the honest weakness: the design is reasoned, not measured.**
+**Load testing is local only.** Every concurrency claim in this document is covered by an
+integration test against real Postgres (30 simultaneous issue requests, 10 simultaneous
+"call next" requests, and issuing while a counter holds the queue lock). On top of that, a
+k6 morning rush (300 patients in 60 s plus 5 counters) held every invariant across about
+5,400 tokens, and after the ADR 0007 lock change take-number p95 was 71–91 ms against a
+250 ms target ([load test report](LOAD-TEST-REPORT.md)). The honest limit: those runs were
+on one laptop, with k6 and the API sharing the CPU. A run on Cloud Run is still to do.
 
-**No display-side offline cache.** A display that boots with no network shows nothing. A
-service worker caching the last snapshot would at least show a stale number with a clear
-badge, which is better than a blank screen in a waiting room.
+**No display-side offline cache.** A display that boots with no network shows nothing. Phase 1
+added a service worker with an offline shell for the *patient's token page* only; the TV
+display would need the same treatment (last snapshot, clearly badged as stale).
+
+**Push is best-effort.** A browser push service may delay or drop a message, an Android
+phone in battery saver may hold it, and an iPhone only receives Web Push from a home-screen
+app. The "called" push has a 5-minute TTL so it is not delivered long after it stopped being
+true. The page itself, and the staff calling the number out, remain the primary channel.
 
 ---
 
@@ -772,6 +861,8 @@ index already serves.
 
 ## 12. Related documents
 
+- `adr/0001-sse-for-public-socketio-for-staff.md` — why the public screens stay on SSE while
+  the staff console moved to Socket.io, and what that costs.
 - `02-DATABASE.md` — every table and column, the state-machine transition table, the
   `queue_counters` lock in full depth with an interleaving timeline, every index and the
   query it serves, the daily reset, retention, and the SQL you will actually run.

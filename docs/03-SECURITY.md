@@ -315,7 +315,7 @@ free to apply) and per-queue-per-day in Postgres (impossible to evade).
 
 It is also why `trust proxy` must be set to exactly the real hop count in production: with
 it unset, `req.ip` is the proxy's own address and *every* visitor on the platform shares one
-bucket. That turns a mild annoyance into a self-inflicted outage. See the deployment guide in the private repo
+bucket. That turns a mild annoyance into a self-inflicted outage. See `04-DEPLOYMENT.md`
 §5.5.
 
 ### 2.5 Residual risk
@@ -1142,21 +1142,23 @@ it touched — so `count === 0` is a detectable conflict rather than a silent wr
 And in raw SQL, where Prisma's types are not helping:
 
 ```sql
-SELECT id, last_number
-  FROM queue_counters
- WHERE "queueId" = $1
-   AND "tenantId" = $2        -- ← redundant for correctness, kept on purpose
-   AND service_date = $3
-   FOR UPDATE
+INSERT INTO queue_counters (id, "tenantId", "queueId", service_date, last_number, "updatedAt")
+VALUES (gen_random_uuid()::text, $1, $2, $3::date, 1, NOW())
+ON CONFLICT ("queueId", service_date)
+DO UPDATE SET last_number = queue_counters.last_number + 1, "updatedAt" = NOW()
+ WHERE queue_counters."tenantId" = EXCLUDED."tenantId"   -- ← tenant check, kept on purpose
+RETURNING last_number
 ```
 
 The code says why:
 
 ```ts
-// tenantId is in the predicate even though (queueId, serviceDate) is already
-// unique: it costs nothing and it means this query, read in isolation during a
-// code review, is visibly tenant-scoped like every other query in the system.
+// The WHERE on the UPDATE keeps it visibly tenant-scoped: a counter row of
+// another tenant is never incremented.
 ```
+
+If the row belongs to another tenant, the `DO UPDATE` affects nothing, `RETURNING` is empty,
+and the service answers 404.
 
 That is a real argument for redundancy: the reviewer scanning for "does every query have a
 tenant filter" should never have to reason about whether a particular one is exempt.
@@ -2067,7 +2069,7 @@ Deliberate omissions, the honest reason, and what would trigger building each.
 | **Automated dependency scanning beyond `npm audit`** | `npm audit` in CI is the whole budget | A Dependabot-shaped incident |
 | **Idle session timeout** | A counter tablet that logs staff out mid-morning is a tablet staff leave logged in by writing the password on it (§10.2) | Per-person devices, alongside 2FA |
 | **`REVOKE DELETE` on `audit_events`** | Append-only is a code property, not a database grant | Trivial to add, and should be, at the same time as the audit viewer |
-| **Backup encryption enforced by the product** | It is documented in the deployment guide in the private repo and is the operator’s responsibility | A managed/hosted tier where QueueLK runs the backups |
+| **Backup encryption enforced by the product** | It is documented in `04-DEPLOYMENT.md` §7 and is the operator's responsibility | A managed/hosted tier where QueueLK runs the backups |
 | **Turning off `patientName` on the display** | The setting does not exist; names are shown if entered | The first clinic that asks. One boolean on `Tenant.features`, which is exactly what that JSON column is for |
 | ~~**Splitting the public snapshot from the console snapshot**~~ | — | **No longer outstanding: implemented.** `PublicService.toPublicQueue()` drops `servedToday` and `averageServiceSeconds` at the edge, with tests in both directions. See §3.5 |
 
