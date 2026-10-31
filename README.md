@@ -1,187 +1,257 @@
-# QueueLK — Multi-tenant Token & Queue Management · Showcase
+# QueueLK
 
-> **This is a public showcase of a private product.** The full source is private (it is being built as a SaaS).
-> This repo contains the architecture, database and security design, selected code excerpts, and a demo,
-> so that recruiters and clients can evaluate the concept and the engineering quality.
-> Full read-only source access can be granted on request for interviews. See [LICENSE](LICENSE).
+A live queue system for Sri Lankan dispensaries, clinics and counters: a screen on the wall,
+a page on the patient's phone, a console for the receptionist and an Android app for patients
+who want one.
 
-**Author:** Janindu Gayanga · [iamjanindu.com](https://iamjanindu.com) · [LinkedIn](https://www.linkedin.com/in/janindu-gayanga-02ba60217) · janindugayanga10@gmail.com
+This repo is the public write-up. The product code is private because I may run QueueLK as a
+business. **Full source is available to interviewers on request**: email me and I'll add you as a
+read-only collaborator for the length of the process.
 
----
+Janindu Gayanga · [iamjanindu.com](https://iamjanindu.com) · [LinkedIn](https://www.linkedin.com/in/janindu-gayanga-02ba60217) · janindugayanga10@gmail.com
 
-## The problem
+![The waiting-room display](screenshots/01-display.png)
 
-In a Sri Lankan dispensary, two or three doctors see patients in turn. A patient walks in, takes a
-paper number, and then has no idea whether the queue is at 12 or at 40.
+## Why I built it
 
-So they do one of two things. They sit on a plastic chair for two hours because they daren't leave.
-Or they wander off to the shop, come back, and find their number was called fifteen minutes ago and
-they've lost their turn. Now there is an argument.
+In a typical dispensary back home, two or three doctors see patients in turn. You walk in, get a
+paper number, and have no idea if they're on 12 or 40. So you either sit on a plastic chair for two
+hours, or you go to the shop and come back to find your number went fifteen minutes ago. The staff
+spend the session shouting numbers over a ceiling fan.
 
-Meanwhile the staff member's actual job for the whole session is shouting numbers across a crowded
-room with a fan running.
+QueueLK replaces that with a QR code at the door. The patient scans it, takes a number, and sees how
+many people are ahead and roughly how long it'll be. Their phone buzzes when they're two away and
+again when they're called. Nothing to install (the app is optional), and it's in Sinhala, Tamil and
+English.
 
-**QueueLK replaces the shouting with a screen on the wall and a page on the patient's phone.** They
-scan a QR code at the door, see exactly how many people are ahead of them and roughly how long it
-will take, and their phone buzzes when they're two away.
+## What it does
 
-No app to install. Works on any phone. Sinhala, Tamil and English.
-
-**Live demo:** _coming soon_ · **Demo video (3 min):** _coming soon_
-
-## Features
-
-| Area | What is built |
-|---|---|
-| Tenants | Multi-tenant schema — `tenantId` on every table and in every `WHERE` clause |
-| Tokens | **Gap-free, duplicate-free numbering under concurrency** (row lock + unique constraint + same-transaction capacity check) |
-| Staff | "Call next" that calls exactly one patient from any number of devices; idempotency on every state-changing action |
-| State | Token state machine — `WAITING → CALLED → SERVING → DONE / NO_SHOW / CANCELLED` — enforced in one file |
-| Patients | Self-service tokens by QR, live position and ETA, sound + vibration alerts, one active token per device per queue |
-| Display | Public TV display, trilingual, auto-reconnecting, built for a cheap Android TV browser |
-| Realtime | SSE over Redis pub/sub, with heartbeats, backoff reconnect and a visible stale state |
-| Reports | Median wait, median service time, no-show rate, CSV export (BOM, formula-injection guarded) |
-| Extras | Thermal ticket printing (58/80mm), QR poster generator with a hand-rolled SVG encoder, daily reset by tenant timezone with no cron job |
-| Auth & security | JWT access (15m, in memory) + refresh (7d, httpOnly, hashed, rotating with reuse detection), OWNER/STAFF roles, rate limiting, Joi config that refuses to boot on placeholder secrets |
-
-## Stack
-
-- **API:** NestJS 10 · TypeScript · Prisma 5 · PostgreSQL 16 · Redis 7 · Swagger/OpenAPI · Jest
-- **Realtime:** SSE (`EventSource`) over Redis pub/sub — one-directional, auto-reconnecting, plain HTTP through any proxy
-- **Web:** Next.js 14 App Router · TanStack Query · Zustand · Tailwind · lucide-react · si/ta/en
-- **Infra:** Docker · docker-compose · GitHub Actions · multi-stage non-root images
-- **Testing:** Jest unit · Supertest integration against **real** Postgres + Redis · Playwright E2E
-
-## Architecture
-
-```
-  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-  │ Staff console│  │  TV display  │  │Patient phone │  │Owner dashbrd │
-  │  /console    │  │  /d/[slug]   │  │ /q/…  /t/…   │  │ /dashboard   │
-  │  (tablet)    │  │ (Android TV) │  │  (QR scan)   │  │  (desktop)   │
-  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-         │                 │                 │                 │
-         └────────┬────────┴────────┬────────┴─────────────────┘
-                  │                 │
-        JSON+JWT  │                 │  SSE (EventSource, text/event-stream)
-                  │                 │
-         ┌────────▼─────────────────▼──────────┐
-         │      apps/web — Next.js 14          │
-         │  App Router · Tailwind · TanStack   │
-         │  Query · Zustand · si/ta/en         │
-         └────────────────┬────────────────────┘
-                          │  JSON + SSE
-         ┌────────────────▼────────────────────────────┐
-         │          apps/api — NestJS 10               │
-         │                                             │
-         │  auth · tenants · queues · tokens           │
-         │  realtime · reports · public · health       │
-         │                                             │
-         │  idempotency · device cookie · rate limit   │
-         └──────┬───────────────────────┬──────────────┘
-                │ Prisma / $queryRaw    │ ioredis
-                │                       │
-      ┌─────────▼──────────┐   ┌────────▼─────────────┐
-      │   PostgreSQL 16    │   │      Redis 7         │
-      │                    │   │                      │
-      │ tenants, users     │   │ pub/sub fan-out      │
-      │ queues             │   │                      │
-      │ queue_counters ◄── │   │ rate-limit windows   │
-      │   THE LOCK ROW     │   │ slug→id cache        │
-      │ tokens             │   │                      │
-      │ idempotency_keys   │   │                      │
-      │ audit_events       │   │                      │
-      └────────────────────┘   └──────────────────────┘
-         system of record          disposable
-```
-
-The structural rule the whole design rests on: **Postgres is the only system of record, and Redis is
-allowed to disappear.** Token numbers are allocated under a Postgres row lock; idempotency records are
-written in the same transaction as the action they guard; the capacity cap is a `COUNT` inside that
-transaction. Flush Redis entirely and the clinic keeps issuing correct, gap-free numbers — displays
-merely go stale until their `EventSource` reconnects. Everything Redis does therefore **fails open**.
-
-Full write-ups: [docs/01-ARCHITECTURE.md](docs/01-ARCHITECTURE.md) · [docs/02-DATABASE.md](docs/02-DATABASE.md) · [docs/03-SECURITY.md](docs/03-SECURITY.md)
-
-## Code excerpts (read-only)
-
-| File | Why it is here |
-|---|---|
-| [samples/token-numbering/tokens.service.excerpt.ts](samples/token-numbering/tokens.service.excerpt.ts) | Token allocation: `SELECT … FOR UPDATE` on the counter row, the unique-constraint backstop, the same-transaction capacity check, and the first-token-of-the-day race handled explicitly |
-| [samples/token-numbering/concurrency.e2e-spec.ts](samples/token-numbering/concurrency.e2e-spec.ts) | 30 concurrent issuers against a **real** PostgreSQL asserting exactly 1..30; 10 concurrent "call next" calling exactly one patient |
-| [samples/token-state/token-state.ts](samples/token-state/token-state.ts) | The state machine as data, not scattered `if`s — and why `DONE → DONE` must be illegal |
-| [samples/token-state/token-state.spec.ts](samples/token-state/token-state.spec.ts) | Exhaustive (status × action) tests, so the illegal transitions stay tested as actions are added |
-| [docs/docker-compose.reference.yml](docs/docker-compose.reference.yml) | How the services are wired locally |
+- Patients take a number by QR, watch their position and ETA live, and get sound, vibration, Web
+  Push or Expo push alerts. They can give up their place from the phone.
+- The TV display shows "now serving" for each queue and rotates its labels through three languages.
+  It runs on a cheap Android TV stick.
+- The staff console is built for one thumb on a tablet: call next, recall, skip, no-show, done, with
+  N/R/S keyboard shortcuts. It shows whether its socket is live.
+- Owners get a dashboard, reports (median wait by hour, no-show rate, staff throughput, CSV export),
+  a printable trilingual QR poster, and an optional nightly three-line summary.
+- Counter staff can issue walk-in tokens and print them on a 58/80 mm thermal printer.
+- Multi-tenant from the start: every table carries `tenantId` and every query filters on it.
 
 ## Screenshots
 
+All taken from the seeded demo clinic. The names are made up.
+
 | | |
 |---|---|
-| **The waiting-room TV** — `/d/[slug]`, trilingual, auto-reconnecting<br>![Display](screenshots/01-display.png) | **The patient's phone** — `/t/[publicId]`, live position and ETA<br>![Patient](screenshots/02-patient-phone.png) |
-| **Nearly your turn** — sound + vibration alert<br>![Nearly](screenshots/03-patient-nearly.png) | **The staff console** — `/console`, thumb-zone primary action<br>![Console](screenshots/04-console.png) |
-| **Owner dashboard** — served count, median wait, no-show rate<br>![Dashboard](screenshots/05-dashboard.png) | **Reports** — medians and CSV export<br>![Reports](screenshots/06-reports.png) |
-| **The printable QR poster** — hand-rolled SVG encoder<br>![Poster](screenshots/07-qr-poster.png) | **Take a number** — what the patient sees after scanning<br>![Take token](screenshots/08-take-token.png) |
-| **Sinhala, Tamil, English** — the patient picks; the clinic sets a default<br>![Trilingual](screenshots/09-trilingual.png) | **Every endpoint documented** — OpenAPI at `/docs`<br>![API docs](screenshots/10-swagger.png) |
+| ![Patient phone](screenshots/02-patient-phone.png)<br>Patient's phone, `/t/[publicId]` | ![Nearly your turn](screenshots/03-patient-nearly.png)<br>Two away: the alert state |
+| ![Console](screenshots/04-console.png)<br>Staff console | ![Take a number](screenshots/08-take-token.png)<br>Take a number, after scanning |
+| ![Dashboard](screenshots/05-dashboard.png)<br>Owner dashboard | ![Reports](screenshots/06-reports.png)<br>Reports (the only page using MUI X) |
+| ![QR poster](screenshots/07-qr-poster.png)<br>QR poster, from a hand-written QR encoder | ![Trilingual](screenshots/09-trilingual.png)<br>Sinhala, Tamil, English |
+| ![Swagger](screenshots/10-swagger.png)<br>API docs at `/docs` | ![Landing](screenshots/11-landing.png)<br>Landing page |
 
-## The interesting problems
+There are no screenshots of the Expo app yet. That needs a real phone and an APK build, which I
+haven't done.
 
-**Token numbers are gap-free and duplicate-free under concurrency.** Thirty patients can scan the QR code
-at the same instant while staff issue a walk-in at the counter, and the numbers that come out are exactly
-1..31. Three layers, each covering the one above: a **row lock** on `queue_counters (queue_id, service_date)`
-taken with `SELECT … FOR UPDATE`, so concurrent issuers serialise in arrival order; **`UNIQUE (queue_id,
-service_date, number)`** on `tokens` as the backstop, so a bypass is a database error rather than two
-printed "A-014"s; and the capacity check in the **same transaction**, so a rejected token cannot have
-consumed a number and left a gap.
+## Architecture
 
-Why not Redis `INCR`: Redis is not the system of record. A restart loses the last increments and the
-counter goes *backwards*, minting duplicates. Even with a perfect Redis, the `INCR` and the `INSERT` are
-two systems — a crash between them burns a number and leaves a gap the display shows as a skipped patient.
-And rollback is impossible: if the insert violates the daily cap, the number is already spent.
+```mermaid
+flowchart LR
+  subgraph Clients
+    TV["TV display<br/>(Android TV browser)"]
+    PH["Patient phone<br/>(web page)"]
+    APP["Patient app<br/>(Expo)"]
+    CON["Staff console<br/>(tablet)"]
+    OWN["Owner dashboard"]
+  end
 
-**The genuine race, handled rather than hoped away.** Before the first token of the day, the counter row
-does not exist — and `FOR UPDATE` cannot lock a row that is not there. Two concurrent first-issuers both
-find nothing, both try to `INSERT`, the unique index lets exactly one win, and the loser catches `P2002`
-and retries the locked read, which now finds the winner's row and blocks on it properly. The retry is
-guaranteed to succeed, so there is no retry loop.
+  WEB["apps/web<br/>Next.js 14"]
+  API["apps/api<br/>NestJS 10"]
+  PG[("PostgreSQL 16<br/>system of record")]
+  RD[("Redis 7<br/>pub/sub, rate limits")]
+  PS["Pub/Sub"]
+  BQ[("BigQuery<br/>token_events + view")]
+  PUSH["Web Push / Expo push"]
 
-**"Call next" pressed on two tablets calls exactly one patient.** The lock is on the **queue** row, not the
-token, because the race is in *choosing* which token — two transactions both choose before either has a
-token to lock. Plus a conditional `UPDATE … WHERE status = 'WAITING'` that asserts the precondition it
-decided on. Plus an **idempotency key** on every state-changing action, so a double-tap on one tablet
-replays the first response instead of calling a second patient. The idempotency record is written in the
-*same transaction* as the state change — which is exactly why it lives in Postgres and not Redis.
+  TV -- SSE --> API
+  PH -- SSE --> API
+  APP -- SSE --> API
+  CON -- Socket.io --> API
+  OWN -- REST --> API
+  TV & PH & CON & OWN --- WEB
+  API -- Prisma + raw SQL --> PG
+  API -- fan-out --> RD
+  API -- after commit --> PS --> BQ
+  API --> PUSH
+```
 
-**A state machine in one file.** The interesting rules are the illegal ones. `DONE → DONE` is rejected
-because it would re-stamp `completedAt`, corrupting the rolling service-time average, which is what every
-waiting patient's ETA is computed from. A double-tap on a tablet would put a wrong number on strangers'
-phones. The rulebook is *data*, not a `switch`, so the unit tests walk every (status, action) pair and
-assert the legal set is exactly the table — a test that cannot drift from the implementation.
+The rule everything rests on: **Postgres is the only system of record, and Redis is allowed to
+disappear.** Numbers come from a Postgres row lock, idempotency records are written in the same
+transaction as the action, and the capacity cap is checked inside that transaction. If you flush
+Redis, the clinic keeps issuing correct numbers and the screens go stale until they reconnect.
 
-**SSE, not WebSockets.** The traffic is one-directional: the server tells displays and phones what changed,
-and they never push back. `EventSource` reconnects on its own with no client library, it is plain HTTP so
-it survives any proxy or captive portal, and it works on the cheap Android TV browser that is the actual
-deployment target. A WebSocket would buy a duplex channel nothing needs, in exchange for reconnection logic
-written by hand.
+On GCP the plan is Cloud Run for the API and web app, a Cloud Run job for migrations, Cloud SQL on a
+private IP, Pub/Sub with a BigQuery subscription, Secret Manager, Artifact Registry and Upstash Redis.
+That's all in Terraform. See [what actually ran](#what-ran-where) before reading too much into it.
 
-**Tests that need a real database.** The concurrency suite fires requests with `Promise.all` against real
-Postgres and Redis, because the thing under test is `SELECT … FOR UPDATE` and a unique constraint — neither
-of which exists in a mock. A mocked version of those tests would pass against code with no locking
-whatsoever, which is precisely the bug they exist to catch. A sequential loop would too.
+## Stack
 
-## Status & roadmap
+NestJS 10, Prisma 5, PostgreSQL 16, Redis 7, Socket.io with `@socket.io/redis-adapter`, SSE, Next.js
+14 (App Router, Tailwind, TanStack Query, Zustand), MUI X on one page, a hand-written service worker
+with Web Push (VAPID), Expo SDK 58 with Expo Router, Pub/Sub and BigQuery, Gemini (optional, free
+tier), Terraform for GCP, Sentry, k6, Jest, Supertest, React Native Testing Library, Playwright,
+Docker Compose and GitHub Actions.
 
-Working end to end — multi-tenant schema, gap-free numbering under concurrency, idempotent staff actions,
-the token state machine, QR self-service tokens, counter issuance with thermal ticket printing, SSE
-realtime, the trilingual public display, the patient phone page with alerts, the staff console, the owner
-dashboard, reports with CSV export, the QR poster generator, JWT auth with refresh rotation and reuse
-detection, daily reset by tenant timezone, retention sweeps, and Swagger at `/docs`.
+## The parts I'd want you to read
 
-Deliberately not in v1, and designed for rather than built: SMS / WhatsApp notifications (the hook exists,
-phone numbers are already hashed), billing and subscriptions (`tenants.plan` and a `features` JSON are in
-the schema), appointments and booking, multi-branch under one owner, and a Go fan-out service for realtime
-— the phase-2 answer if displays ever exceed a few thousand concurrent connections. A clinic has three.
+### Gap-free numbers under concurrency
 
-## Access to full source
+Thirty patients can scan at the same moment while the receptionist issues a walk-in, and the numbers
+that come out are exactly 1 to 31. No gaps, no duplicates.
 
-Interviewers / hiring managers: email me and I will add you as a **read-only collaborator** on the private repo for the
-duration of the process.
+Issuing takes one lock: the row in `queue_counters` for that queue and day, claimed with a single
+`INSERT ... ON CONFLICT DO UPDATE ... RETURNING`. Issuers queue on that row in arrival order. A
+`UNIQUE (queue_id, service_date, number)` constraint backs it up in case anything ever bypasses the
+service. The device check and the daily cap run in the same transaction, so a rejected token rolls
+its number back instead of leaving a hole on the display.
+
+I didn't use Redis `INCR` because Redis isn't the system of record and a crash between the `INCR` and
+the `INSERT` burns a number. I didn't use a Postgres sequence because `nextval()` isn't rolled back.
+
+The first version used `SELECT ... FOR UPDATE` on the queue row for everything, and that's where the
+load test found the problem (below).
+
+[`samples/numbering/issue-token.excerpt.ts`](samples/numbering/issue-token.excerpt.ts)
+
+### "Call next" on two tablets calls one patient
+
+Counter actions lock the queue row, because the race is in *choosing* which token to call. Two
+transactions can both pick the same token before either has locked it. The update is also
+conditional (`WHERE status = 'WAITING'`), and every staff action carries an idempotency key, so a
+double tap on a slow tablet replays the first response instead of calling a second patient. The
+idempotency row lives in Postgres and is written in the same transaction as the action. That's the
+whole reason it isn't in Redis.
+
+The lock is `FOR NO KEY UPDATE`, not `FOR UPDATE`. I found that out the hard way: with `FOR UPDATE`,
+patients taking a number still waited for the counter, because inserting a token checks its foreign
+key to `queues` with `FOR KEY SHARE`, and `FOR UPDATE` blocks that. One test run hung with seven
+issuers stuck behind a counter. `FOR NO KEY UPDATE` still serialises counter actions but leaves
+issuers alone.
+
+[`samples/numbering/queue-lock.ts`](samples/numbering/queue-lock.ts) ·
+[`samples/numbering/locks.e2e-spec.ts`](samples/numbering/locks.e2e-spec.ts) ·
+[`samples/idempotency/idempotency.service.ts`](samples/idempotency/idempotency.service.ts)
+
+### A state machine in one file
+
+`WAITING -> CALLED -> SERVING -> DONE | NO_SHOW | CANCELLED`, with the legal transitions as data. The
+interesting rules are the illegal ones. `DONE -> DONE` is rejected because it would re-stamp
+`completedAt`, which skews the rolling service-time average that every waiting patient's ETA comes
+from. The tests walk every (status, action) pair.
+
+[`samples/token-state/`](samples/token-state/)
+
+### Notifications as a chain
+
+Each channel (Expo push, Web Push, SMS) implements one small interface, and a dispatcher walks the
+tenant's chain, `expo -> push -> sms`, stopping at the first one that delivers. The free channels
+always go first. A "claim" step runs once, right before the first send, so two API instances can't
+both notify the same patient. SMS is a stub with a fake provider: I only store a hash and the last
+four digits of a phone number, so there's nothing to text yet.
+
+[`samples/notifications/`](samples/notifications/)
+
+## Engineering decisions
+
+The full ADRs are in [`docs/adr`](docs/adr). Short version:
+
+1. **SSE for the public screens, Socket.io for staff** ([0001](docs/adr/0001-sse-for-public-socketio-for-staff.md)).
+   The TV and phones only listen, and SSE is plain HTTP that reconnects by itself on a cheap TV
+   browser. The console sends commands and needs an answer ("which patient did I just call?"), so it
+   moved to Socket.io with a JWT handshake, acknowledged commands and a REST fallback.
+2. **Expo for the patient app, on the same SSE stream** ([0002](docs/adr/0002-expo-patient-app.md)).
+   Expo push is just another channel in the chain, and the API never holds a Firebase key.
+3. **MUI X only on the reports page** ([0003](docs/adr/0003-mui-only-on-the-reports-page.md)).
+   The DataGrid saves days of work there, but the TV and patient pages run on cheap hardware and
+   shouldn't pay for it. Both styling systems read the same token file, with a test that fails if
+   they drift.
+4. **Token events to BigQuery through Pub/Sub, after commit** ([0004](docs/adr/0004-token-events-to-bigquery.md)).
+   Not a transactional outbox: losing one analytics row in a crash is fine for trend charts. Events
+   carry a deterministic `event_id` so redelivery is counted once, and no patient data goes to the
+   warehouse.
+5. **Upstash instead of Memorystore** ([0005](docs/adr/0005-upstash-redis-instead-of-memorystore.md)),
+   because Redis holds nothing that matters and Memorystore costs money every hour.
+6. **Cloud Run instead of GKE** ([0006](docs/adr/0006-cloud-run-instead-of-gke.md)). Scales to zero
+   overnight. The cost is a 60-minute cap on WebSocket and SSE connections, which the clients already
+   handle by reconnecting.
+7. **Issue on the counter row only** ([0007](docs/adr/0007-issue-on-the-counter-row-only.md)), the
+   lock change described above.
+
+## Numbers
+
+**Load test.** A k6 "morning rush": 300 patients take numbers within 60 seconds while 5 counters keep
+calling and finishing, all on one queue. The teardown checks the numbers are exactly 1..N, unique,
+and that nobody was called twice.
+
+- After the lock change, take-number p95 was **71 to 91 ms** (the old build: 91 to 132 ms, run
+  interleaved in the same session). p99 dropped in every paired round. Target was 250 ms.
+- No gaps, duplicates or double calls in any run: about 2,100 tokens on day one and 3,300 on day two.
+- Day one missed the target (377 ms at best) on a laptop that was also running other projects. Most of
+  that turned out to be the machine. One run did find a real bug: making the broadcast after an issue
+  fire-and-forget exhausted the Prisma pool and p95 went to 7.6 s. I fixed it by coalescing broadcasts
+  per queue and wrote a [postmortem](docs/postmortems/2026-10-30-morning-rush-pool-exhaustion.md).
+
+Honest caveat: k6 and the API shared one laptop's CPU. A run on Cloud Run is the next check.
+[Full report](docs/LOAD-TEST-REPORT.md) · [the script](samples/load/morning-rush.js)
+
+**Tests** (counted 2026-10-31):
+
+| Suite | Tests |
+|---|---|
+| API unit | 235 |
+| API integration, real Postgres + Redis | 113 |
+| Analytics, on the Pub/Sub and BigQuery emulators | 3 |
+| Web unit | 44 |
+| Playwright | 10 |
+| Mobile (Jest + React Native Testing Library) | 72 |
+| Terraform plan-time tests | 8 |
+
+The integration tests hit a real Postgres on purpose. A mocked version of the concurrency tests would
+pass against code with no locking at all, which is exactly the bug they exist to catch.
+
+## What ran where
+
+Everything ran on my Windows laptop. Nothing has run on a real GCP project yet.
+
+- Postgres and Redis in Docker, for the integration suite and the k6 runs.
+- Pub/Sub on Google's official emulator and BigQuery on the goccy emulator. The emulator has no
+  BigQuery subscriptions, so a small loader stands in for that step locally.
+- Terraform: `terraform validate`, 8 `terraform test` runs on mocked providers, and an offline plan
+  (89 resources). Never applied.
+- The CD workflow (keyless, Workload Identity Federation) is written but has never run.
+- Observability: JSON logs, log-based metrics, a dashboard and an SLO (display updates within 2 s of
+  "call next") are in Terraform; Sentry is wired into the API, web and app with an optional DSN.
+- The Expo app is tested with Jest and an Android bundle export. No APK yet.
+
+## Not built yet
+
+- Real SMS or WhatsApp. The interface is there; an encrypted phone vault isn't.
+- Billing. `tenants.plan` and a `features` column exist and already drive the notification chain.
+- Appointments, multi-branch owners.
+- Delivering the nightly summary by email or push. It's stored and shown on the reports page.
+- Expo push receipts aren't polled, only the immediate ticket.
+
+If I started again I'd write the load test in week one. The lock design looked right in the
+integration tests for weeks, and it took 300 fake patients to show me where the time went.
+
+## More docs
+
+- [Architecture](docs/01-ARCHITECTURE.md): the life of one token from QR scan to done, failure modes,
+  what I rejected and why.
+- [Database](docs/02-DATABASE.md): every table, the state machine, the numbering invariant, indexes.
+- [Security](docs/03-SECURITY.md): threat model (500 fake tokens, a stolen tablet, a rival reading
+  your queue) and a list of what isn't handled.
+
+## License
+
+Copyright (c) 2026 Janindu Gayanga. All rights reserved. See [LICENSE](LICENSE). You can read this
+repo; you can't copy, modify, distribute or use any of it commercially.
