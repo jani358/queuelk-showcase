@@ -1,11 +1,5 @@
-/**
- * SHOWCASE EXCERPT — QueueLK · apps/api/src/tokens/token-state.spec.ts
- *
- * Demonstrates: exhaustive testing of a state machine. Rather than asserting a
- * handful of happy paths, these tests enumerate the full (status × action)
- * space and assert that everything outside the rule table is rejected — which
- * is the only way the illegal transitions stay tested as actions are added.
- */
+// From apps/api/src/tokens/token-state.spec.ts in the private repo. Unchanged.
+
 import { TokenStatus } from '@prisma/client';
 import {
   ACTIVE_STATUSES,

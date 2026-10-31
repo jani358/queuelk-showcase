@@ -1,15 +1,5 @@
-/**
- * SHOWCASE EXCERPT — QueueLK · apps/api/src/tokens/token-state.ts
- *
- * Demonstrates: a state machine expressed as DATA rather than as scattered
- * `if`s, so the unit tests can walk every (status, action) pair and assert the
- * legal set is exactly the table — a test that cannot drift from the code.
- *
- * The interesting rules are the illegal ones. DONE -> DONE looks harmless until
- * you notice it re-stamps completedAt, which corrupts the rolling service-time
- * average, which is what every waiting patient's ETA is computed from. One
- * double-tapped button would put a wrong number on strangers' phones.
- */
+// From apps/api/src/tokens/token-state.ts in the private repo. Unchanged.
+
 import { TokenStatus } from '@prisma/client';
 
 /**
